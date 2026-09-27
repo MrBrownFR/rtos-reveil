@@ -29,8 +29,6 @@ extern "C" {
 /* Includes ------------------------------------------------------------------*/
 #include "stm32l4xx_hal.h"
 
-#include "stm32l4xx_nucleo.h"
-
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -51,6 +49,8 @@ extern "C" {
 
 /* USER CODE END EM */
 
+void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
+
 /* Exported functions prototypes ---------------------------------------------*/
 void Error_Handler(void);
 
@@ -59,16 +59,37 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define B1_Pin GPIO_PIN_13
+#define B1_GPIO_Port GPIOC
+#define B1_EXTI_IRQn EXTI15_10_IRQn
 #define USART_TX_Pin GPIO_PIN_2
 #define USART_TX_GPIO_Port GPIOA
 #define USART_RX_Pin GPIO_PIN_3
 #define USART_RX_GPIO_Port GPIOA
+#define PWM_Motor_Pin GPIO_PIN_5
+#define PWM_Motor_GPIO_Port GPIOA
+#define POT_Pin GPIO_PIN_6
+#define POT_GPIO_Port GPIOA
+#define LED2_Pin GPIO_PIN_7
+#define LED2_GPIO_Port GPIOA
+#define LED5_Pin GPIO_PIN_2
+#define LED5_GPIO_Port GPIOB
+#define SW2_Pin GPIO_PIN_11
+#define SW2_GPIO_Port GPIOB
+#define SW2_EXTI_IRQn EXTI15_10_IRQn
+#define DIR_Pin GPIO_PIN_9
+#define DIR_GPIO_Port GPIOA
 #define TMS_Pin GPIO_PIN_13
 #define TMS_GPIO_Port GPIOA
 #define TCK_Pin GPIO_PIN_14
 #define TCK_GPIO_Port GPIOA
+#define SW1_Pin GPIO_PIN_15
+#define SW1_GPIO_Port GPIOA
+#define SW1_EXTI_IRQn EXTI15_10_IRQn
 #define SWO_Pin GPIO_PIN_3
 #define SWO_GPIO_Port GPIOB
+#define DIS_Pin GPIO_PIN_5
+#define DIS_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
