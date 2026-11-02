@@ -57,9 +57,6 @@ TIM_HandleTypeDef htim5;
 osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
 
-UART_HandleTypeDef huart2;
-I2C_HandleTypeDef hi2c1;
-
 struct temps {
 unsigned char  heure;
 unsigned char  min;
@@ -69,9 +66,6 @@ struct temps horloge = 	{ 0, 0, 0 };
 struct temps alarm = 	{ 0, 0, 0 };
 char Oled[20];
 char Retro = 1;
-
-uint8_t buffer;
-SemaphoreHandle_t semaph_uartRx = {0};
 
 static uint8_t rx_byte;
 QueueHandle_t rxQueue;
@@ -148,7 +142,6 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   /* add semaphores, ... */
-  semaph_uartRx = xSemaphoreCreateBinary();
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
@@ -602,6 +595,10 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+/*----------------------------------------------------------------------------
+ *        Functions
+ *---------------------------------------------------------------------------*/
+
 // Reads characters until '\r' or '\n'. Returns false on timeout.
 static bool read_line(char *buf, size_t size, TickType_t timeout){
   size_t n = 0;
@@ -631,8 +628,9 @@ static bool parse_time(const char *s, int *h, int *m, int *sec){
 
 
 /*----------------------------------------------------------------------------
- *        Taches
+ *        Tasks
  *---------------------------------------------------------------------------*/
+
 void chrono (void *pvParameters) {
 
   TickType_t xLastWakeTime;
@@ -702,7 +700,9 @@ void edit_time(void *pvParameters)
   }
 }
 
-
+/*----------------------------------------------------------------------------
+ *        Callbacks
+ *---------------------------------------------------------------------------*/
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
   if (huart->Instance == hlpuart1.Instance) {
