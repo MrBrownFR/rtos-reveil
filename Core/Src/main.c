@@ -22,17 +22,21 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "retarget.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include "ssd1306.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef enum { DROITE, GAUCHE } Sens_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define POS_MIN  -3000
+#define POS_MAX   3000
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -52,7 +56,15 @@ UART_HandleTypeDef huart2;
 
 osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
+char Oled[20];
+char Retro =1;
+//
+uint32_t potent_value;
 
+int32_t enc_pos;
+Sens_t sens = DROITE;
+
+int32_t pos;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -66,7 +78,7 @@ static void MX_TIM5_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
-
+void motorspeed( void *pvParameters );
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -110,6 +122,16 @@ int main(void)
   MX_TIM5_Init();
   /* USER CODE BEGIN 2 */
 
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+  htim2.Instance->CCR1 = 0;
+  HAL_ADC_Start(&hadc1);
+
+  //TIM 5 en encodeur
+  HAL_TIM_Encoder_Start(&htim5, TIM_CHANNEL_ALL);
+  __HAL_TIM_SET_COUNTER(&htim5, 0);   // position 0 = position de départ
+  // Lecture (le cast en int32_t donne les positions négatives)
+  enc_pos = (int32_t)__HAL_TIM_GET_COUNTER(&htim5);
+
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */
@@ -132,6 +154,14 @@ int main(void)
   /* definition and creation of defaultTask */
   osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 128);
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
+
+
+  xTaskCreate(      motorspeed,       /* Function that implements the task. */
+                      "Vitesse du moteur",          /* Text name for the task. */
+                      1024,      /* Stack size in words, not bytes. */
+                      NULL,    /* Parameter passed into the task. */
+                      tskIDLE_PRIORITY+1,/* Priority at which the task is created. */
+                      NULL );      /* Used to pass out the created task's handle. */
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -516,6 +546,40 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+void balayage()
+{
+    pos = (int32_t)__HAL_TIM_GET_COUNTER(&htim5);
+
+    if (sens == DROITE && pos <= POS_MIN) sens = GAUCHE;
+    else if (sens == GAUCHE && pos >= POS_MAX) sens = DROITE;
+    HAL_GPIO_WritePin(DIR_GPIO_Port, DIR_Pin, sens);
+}
+
+void motorspeed( void *pvParameters ){
+
+	  TickType_t xLastWakeTime;
+	  const TickType_t xFrequency = 500 / portTICK_RATE_MS;
+
+
+	  xLastWakeTime = xTaskGetTickCount();
+
+	while(1){
+		potent_value = HAL_ADC_GetValue(&hadc1);
+
+		sprintf( Oled, "%d", potent_value );
+		SSD1306_GotoXY (0,30);
+		SSD1306_Puts (Oled, &Font_11x18, Retro);
+		SSD1306_UpdateScreen();
+		HAL_ADC_Start(&hadc1);
+
+		int rotationspeed = htim2.Instance->ARR * potent_value / 4036;
+		htim2.Instance->CCR1 = rotationspeed;
+		balayage();
+
+		vTaskDelayUntil(&xLastWakeTime, xFrequency);
+	}
+}
 
 /* USER CODE END 4 */
 
