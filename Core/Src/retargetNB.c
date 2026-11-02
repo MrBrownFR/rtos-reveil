@@ -22,17 +22,16 @@
 
 UART_HandleTypeDef *gHuart;
 
-SemaphoreHandle_t semaph_printf ; //NB p
-
+static SemaphoreHandle_t uart_mutex;   // xSemaphoreCreateMutex()
+static SemaphoreHandle_t uart_done;    // xSemaphoreCreateBinary()
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart);//NB
 
 void RetargetInit(UART_HandleTypeDef *huart) {
   gHuart = huart;
 
-  semaph_printf = xSemaphoreCreateBinary(); //NB
-//  configASSERT(semaph_printf != NULL);
-  xSemaphoreGive(semaph_printf);
+  uart_mutex = xSemaphoreCreateMutex();
+  uart_done = xSemaphoreCreateBinary();
 
   /* Disable I/O buffering for STDOUT stream, so that
    * chars are sent out as soon as they are printed. */
@@ -47,33 +46,32 @@ int _isatty(int fd) {
   return 0;
 }
 
-int _write(int fd, char* ptr, int len) {
-  HAL_StatusTypeDef hstatus;
-
-  if (fd == STDOUT_FILENO || fd == STDERR_FILENO) {
-    xSemaphoreTake(semaph_printf, portMAX_DELAY);   // attend que l'UART soit libre
-
-    hstatus = HAL_UART_Transmit_IT(gHuart, (uint8_t *) ptr, len);
-    if (hstatus != HAL_OK) {
-      xSemaphoreGive(semaph_printf);
-      return EIO;
-    }
-
-    // attend que CETTE transmission se termine (donné par le callback ISR)
-    xSemaphoreTake(semaph_printf, portMAX_DELAY);
-    xSemaphoreGive(semaph_printf);   // libère pour le prochain appel
-
-    return len;
+int _write(int fd, char *ptr, int len) {
+  if (fd != STDOUT_FILENO && fd != STDERR_FILENO) {
+    errno = EBADF;
+    return -1;
   }
-  errno = EBADF;
-  return -1;
+
+  xSemaphoreTake(uart_mutex, portMAX_DELAY);
+
+  if (HAL_UART_Transmit_IT(gHuart, (uint8_t *)ptr, len) != HAL_OK) {
+    xSemaphoreGive(uart_mutex);
+    errno = EIO;
+    return -1;
+  }
+
+  xSemaphoreTake(uart_done, portMAX_DELAY);   // attend le callback ISR
+  xSemaphoreGive(uart_mutex);
+  return len;
 }
 
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart){
-	if (huart ->Instance == gHuart ->Instance)
-	xSemaphoreGiveFromISR(semaph_printf, NULL);
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+  if (huart->Instance == gHuart->Instance) {
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(uart_done, &woken);
+    portYIELD_FROM_ISR(woken);
+  }
 }
-
 
 
 int _close(int fd) {
