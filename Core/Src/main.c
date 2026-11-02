@@ -66,8 +66,9 @@ unsigned char  min;
 unsigned char  sec;
 };
 struct temps horloge = 	{ 0, 0, 0 };
+struct temps alarm = 	{ 0, 0, 0 };
 char Oled[20];
-char Retro =1;
+char Retro = 1;
 
 uint8_t buffer;
 SemaphoreHandle_t semaph_uartRx = {0};
@@ -669,10 +670,10 @@ void edit_time(void *pvParameters)
   while (1) {
     xQueueReceive(rxQueue, &c, portMAX_DELAY);
 
-    if (c == 'H') {
+    if (c == 'H' || c == 'h') {
       printf("Enter time (HH:MM:SS): \r\n");
 
-      if (!read_line(line, sizeof line, pdMS_TO_TICKS(15000))) {
+      if (!read_line(line, sizeof line, pdMS_TO_TICKS(20000))) {
         printf("Timeout\r\n");
       } else if (parse_time(line, &h, &m, &s)) {
         horloge.heure = h;
@@ -683,6 +684,21 @@ void edit_time(void *pvParameters)
         printf("Invalid format\r\n");
       }
     }
+
+    if (c == 'A' || c == 'a' ) {
+          printf("Setup alarm (HH:MM:SS): \r\n");
+
+          if (!read_line(line, sizeof line, pdMS_TO_TICKS(20000))) {
+            printf("Timeout\r\n");
+          } else if (parse_time(line, &h, &m, &s)) {
+            alarm.heure = h;
+        	alarm.min = m;
+        	alarm.sec = s;
+            printf("Alarm set to %02d:%02d:%02d\r\n", h, m, s);
+          } else {
+            printf("Invalid format\r\n");
+          }
+        }
   }
 }
 
