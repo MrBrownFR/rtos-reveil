@@ -29,8 +29,6 @@ extern "C" {
 /* Includes ------------------------------------------------------------------*/
 #include "stm32l4xx_hal.h"
 
-#include "stm32l4xx_nucleo.h"
-
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -59,16 +57,26 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define SDO_Pin GPIO_PIN_2
+#define SDO_GPIO_Port GPIOC
+#define SDI_Pin GPIO_PIN_3
+#define SDI_GPIO_Port GPIOC
 #define USART_TX_Pin GPIO_PIN_2
 #define USART_TX_GPIO_Port GPIOA
 #define USART_RX_Pin GPIO_PIN_3
 #define USART_RX_GPIO_Port GPIOA
+#define SCK_Pin GPIO_PIN_10
+#define SCK_GPIO_Port GPIOB
 #define TMS_Pin GPIO_PIN_13
 #define TMS_GPIO_Port GPIOA
 #define TCK_Pin GPIO_PIN_14
 #define TCK_GPIO_Port GPIOA
 #define SWO_Pin GPIO_PIN_3
 #define SWO_GPIO_Port GPIOB
+#define CE_Pin GPIO_PIN_8
+#define CE_GPIO_Port GPIOB
+#define CSN_Pin GPIO_PIN_9
+#define CSN_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 
