@@ -26,7 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
-#include "math.h"
+#include "../../Drivers/VL53L1_Nucleo/core/inc/vl53l1_api.h"
 //#include "ssd1306.h"
 /* USER CODE END Includes */
 
@@ -67,6 +67,10 @@ typedef struct {
 
 #define HOUR_CHANGED_EVT (1 << 0)
 #define ALARM_CHANGED_EVT (1 << 1)
+#define TOF_MESURED_EVT (1 << 2)
+
+#define TOF_INTERVAL 10000	//5min : 5 * 60 * 1000 = 300 000s (pour le test, on met 10s soit 10 000ms)
+#define TOF_SEND_ID 0x01
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -78,6 +82,8 @@ typedef struct {
 ADC_HandleTypeDef hadc1;
 
 CAN_HandleTypeDef hcan1;
+
+I2C_HandleTypeDef hi2c1;
 
 UART_HandleTypeDef hlpuart1;
 UART_HandleTypeDef huart2;
@@ -110,6 +116,13 @@ QueueHandle_t rxCANQueue;
 
 EventGroupHandle_t update_time_evt_grp;
 
+SemaphoreHandle_t i2c_sem;
+
+VL53L1_Dev_t devLeft;
+VL53L1_Dev_t devRight;
+
+int16_t Tof_measure = 50;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -121,6 +134,7 @@ static void MX_ADC1_Init(void);
 static void MX_TIM5_Init(void);
 static void MX_LPUART1_UART_Init(void);
 static void MX_CAN1_Init(void);
+static void MX_I2C1_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
@@ -128,6 +142,7 @@ void vFanTask( void *pvParameters );
 void vEditTimeTask( void *pvParameters );
 void vRxMsgCanTask( void* pvParameters);
 void vTxMsgCanTask(void *pvParameters);
+void vReadTofTask(void *pvParameters);
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan);
 //void receive(char a);
@@ -173,6 +188,7 @@ int main(void)
   MX_TIM5_Init();
   MX_LPUART1_UART_Init();
   MX_CAN1_Init();
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
   RetargetInit(&hlpuart1);
   HAL_UART_Receive_IT(&hlpuart1, &rxUART_byte, 1);
@@ -203,6 +219,7 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   /* add semaphores, ... */
+  i2c_sem = xSemaphoreCreateMutex();
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
@@ -235,7 +252,7 @@ int main(void)
   /* add threads, ... */
   xTaskCreate(		vEditTimeTask,       /* Function that implements the task. */
                     "TIME EDITION",          /* Text name for the task. */
-                    1024,      /* Stack size in words, not bytes. */
+                    512,      /* Stack size in words, not bytes. */
                     NULL,    /* Parameter passed into the task. */
                     tskIDLE_PRIORITY+3,/* Priority at which the task is created. */
                     NULL );      /* Used to pass out the created task's handle. */
@@ -256,10 +273,18 @@ int main(void)
 
 	xTaskCreate(      vFanTask,       /* Function that implements the task. */
 	          "Vitesse du moteur",          /* Text name for the task. */
-	           1024,      /* Stack size in words, not bytes. */
+	           512,      /* Stack size in words, not bytes. */
 	           NULL,    /* Parameter passed into the task. */
 	           tskIDLE_PRIORITY+1,/* Priority at which the task is created. */
 	           NULL );      /* Used to pass out the created task's handle. */
+
+	xTaskCreate(      vReadTofTask,       /* Function that implements the task. */
+		          "lecture des tof",          /* Text name for the task. */
+		           512,      /* Stack size in words, not bytes. */
+		           NULL,    /* Parameter passed into the task. */
+		           tskIDLE_PRIORITY+1,/* Priority at which the task is created. */
+		           NULL );      /* Used to pass out the created task's handle. */
+
 
   /* USER CODE END RTOS_THREADS */
 
@@ -451,6 +476,54 @@ static void MX_CAN1_Init(void)
 }
 
 /**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x00F12981;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
   * @brief LPUART1 Initialization Function
   * @param None
   * @retval None
@@ -636,6 +709,9 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOH, SHUT1_Pin|SHUT2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, LED5_Pin|DIS_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
@@ -646,6 +722,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : SHUT1_Pin SHUT2_Pin */
+  GPIO_InitStruct.Pin = SHUT1_Pin|SHUT2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOH, &GPIO_InitStruct);
 
   /*Configure GPIO pins : LED5_Pin DIS_Pin */
   GPIO_InitStruct.Pin = LED5_Pin|DIS_Pin;
@@ -673,6 +756,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(SW1_GPIO_Port, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : INTOF2_Pin INTOF1_Pin */
+  GPIO_InitStruct.Pin = INTOF2_Pin|INTOF1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
@@ -687,6 +776,10 @@ static void MX_GPIO_Init(void)
 /*----------------------------------------------------------------------------
  *        Functions
  *---------------------------------------------------------------------------*/
+
+void HAL_Delay(uint32_t Delay) {
+	vTaskDelay(pdMS_TO_TICKS((Delay)));
+}
 
 void update_fan() {
     enc_pos = (int32_t) __HAL_TIM_GET_COUNTER(&htim5);
@@ -723,6 +816,115 @@ static bool parse_time(const char *s, int *h, int *m, int *sec){
   if (n != 3)
 	  return false;
   return (*h >= 0 && *h < 24) && (*m >= 0 && *m < 60) && (*sec >= 0 && *sec < 60);
+}
+
+void ResetAndInitializeTOF1(void) {
+	VL53L1_DEV Dev;
+	VL53L1_DetectionConfig_t DetectionConfig;
+	uint8_t newI2C = 0x52;
+	/* Reset the 1 ToF sensors on the expansion board */
+	HAL_GPIO_WritePin(GPIOH, SHUT1_Pin, GPIO_PIN_RESET);
+	HAL_Delay(10);
+	/* Bring the sensors out of the reset stage one by one and set the new I2C address */
+	Dev = &devLeft;
+	HAL_GPIO_WritePin(GPIOH, SHUT1_Pin, GPIO_PIN_SET);
+	HAL_Delay(50);
+	Dev->comms_speed_khz = 400;
+	Dev->I2cHandle = &hi2c1;
+	Dev->comms_type = 1;
+	Dev->I2cDevAddr = 0x52;
+	VL53L1_SetDeviceAddress(Dev, newI2C);
+	Dev->I2cDevAddr = newI2C;
+	/* Device Initialization and setting */
+	VL53L1_WaitDeviceBooted(Dev);
+	VL53L1_DataInit(Dev);
+	VL53L1_StaticInit(Dev);
+	/* Vérification de l'identification du capteur */
+	uint8_t device_id = 0;
+	VL53L1_RdByte(Dev, 0x010F, &device_id);
+	char msg[30];
+	sprintf(msg, "TOF1 ID: 0x%02X\r\n", device_id);
+	HAL_UART_Transmit(&huart2, msg, strlen(msg), HAL_MAX_DELAY);
+	VL53L1_SetDistanceMode(Dev, VL53L1_DISTANCEMODE_SHORT);
+	VL53L1_SetMeasurementTimingBudgetMicroSeconds(Dev, 40000);
+	VL53L1_SetInterMeasurementPeriodMilliSeconds(Dev, 50);
+	memset(&DetectionConfig, 0, sizeof(DetectionConfig));
+	DetectionConfig.DetectionMode = VL53L1_DETECTION_DISTANCE_ONLY;
+	DetectionConfig.IntrNoTarget = 0;
+	DetectionConfig.Distance.CrossMode = VL53L1_THRESHOLD_CROSSED_LOW;
+	DetectionConfig.Distance.Low = 300;
+	DetectionConfig.Distance.High = 1000;
+	VL53L1_SetThresholdConfig(Dev, &DetectionConfig);
+	VL53L1_UserRoi_t roiConfig;
+	roiConfig.TopLeftX = 0;
+	roiConfig.TopLeftY = 15;
+	roiConfig.BotRightX = 15;
+	roiConfig.BotRightY = 0;
+//	VL53L1_SetUserROI(Dev, &roiConfig);
+	VL53L1_Error err = VL53L1_ClearInterruptAndStartMeasurement(Dev);
+	sprintf(msg, "TOF1 start err: %d\r\n", err);
+	HAL_UART_Transmit(&huart2, msg, strlen(msg), HAL_MAX_DELAY);
+}
+
+void ResetAndInitializeTOF2(void) {
+	VL53L1_DEV Dev;
+	VL53L1_DetectionConfig_t DetectionConfig;
+	uint8_t newI2C = 0x52 + 4;
+	VL53L1_Error err;
+	char msg[20];
+	/* Reset the 1 ToF sensors on the expansion board */
+	HAL_GPIO_WritePin(GPIOH, SHUT2_Pin, GPIO_PIN_RESET);
+	HAL_Delay(10);
+	/* Bring the sensors out of the reset stage one by one and set the new I2C address */
+	Dev = &devRight;
+	HAL_GPIO_WritePin(GPIOH, SHUT2_Pin, GPIO_PIN_SET);
+	HAL_Delay(50);
+	Dev->comms_speed_khz = 400;
+	Dev->I2cHandle = &hi2c1;
+	Dev->comms_type = 1;
+	Dev->I2cDevAddr = 0x52; /* default ToF sensor I2C address*/
+	err = VL53L1_SetDeviceAddress(Dev, newI2C);
+	sprintf(msg, "TOF2 address err: %d\r\n", err);
+	HAL_UART_Transmit(&huart2, msg, strlen(msg), HAL_MAX_DELAY);
+	Dev->I2cDevAddr = newI2C;
+	/* Device Initialization and setting */
+	VL53L1_WaitDeviceBooted(Dev);
+	VL53L1_DataInit(Dev);
+	VL53L1_StaticInit(Dev);
+	/* Vérification de l'identification du capteur */
+	uint8_t device_id = 0;
+	VL53L1_RdByte(Dev, 0x010F, &device_id);
+	sprintf(msg, "TOF2 ID: 0x%02X\r\n", device_id);
+	HAL_UART_Transmit(&huart2, msg, strlen(msg), HAL_MAX_DELAY);
+	VL53L1_SetDistanceMode(Dev, VL53L1_DISTANCEMODE_SHORT);
+	VL53L1_SetMeasurementTimingBudgetMicroSeconds(Dev, 40000);
+	VL53L1_SetInterMeasurementPeriodMilliSeconds(Dev, 50);
+	memset(&DetectionConfig, 0, sizeof(DetectionConfig));
+	DetectionConfig.DetectionMode = VL53L1_DETECTION_DISTANCE_ONLY;
+	DetectionConfig.IntrNoTarget = 0;
+	DetectionConfig.Distance.CrossMode = VL53L1_THRESHOLD_CROSSED_LOW;
+	DetectionConfig.Distance.Low = 300;
+	DetectionConfig.Distance.High = 500;
+	VL53L1_SetThresholdConfig(Dev, &DetectionConfig);
+	VL53L1_UserRoi_t roiConfig;
+	roiConfig.TopLeftX = 0;
+	roiConfig.TopLeftY = 15;
+	roiConfig.BotRightX = 15;
+	roiConfig.BotRightY = 0;
+	VL53L1_SetUserROI(Dev, &roiConfig);
+	err = VL53L1_ClearInterruptAndStartMeasurement(Dev);
+	sprintf(msg, "TOF2 start err: %d\r\n", err);
+	HAL_UART_Transmit(&huart2, msg, strlen(msg), HAL_MAX_DELAY);
+}
+
+// Écrit le Q8 sur 4 octets : 3 octets de partie entière (big-endian) puis 1 octet de décimale
+static void q8_to_bytes(Q8 v, uint8_t *p)
+{
+    int32_t i = v.integer;
+    p[0] = (uint8_t)( i        & 0xFF);   // poids faible en premier
+    p[1] = (uint8_t)((i >> 8)  & 0xFF);
+    p[2] = (uint8_t)((i >> 16) & 0xFF);
+    p[3] = (uint8_t)v.dec;
 }
 
 /*----------------------------------------------------------------------------
@@ -786,7 +988,7 @@ void vTxMsgCanTask(void *pvParameters){
 	HAL_CAN_Start(&hcan1);
 
 	static CAN_TxHeaderTypeDef hdr = {
-	        .StdId = CAN_ID_MASTER,
+	        .StdId = 0x00,
 	        .IDE   = CAN_ID_STD,
 	        .RTR   = CAN_RTR_DATA,
 	        .DLC   = 4,
@@ -803,7 +1005,7 @@ void vTxMsgCanTask(void *pvParameters){
 
 		uxBits = xEventGroupWaitBits(
 			update_time_evt_grp,   /* The event group being tested. */
-			HOUR_CHANGED_EVT | ALARM_CHANGED_EVT, /* The bits within the event group to wait for. */
+			HOUR_CHANGED_EVT | ALARM_CHANGED_EVT | TOF_MESURED_EVT, /* The bits within the event group to wait for. */
 			pdTRUE,
 			pdFALSE,       /* Don't wait for both bits, either bit will do. */
 			pdMS_TO_TICKS(1000) );/* Wait a maximum of x ms for either bit to be set. */
@@ -829,6 +1031,17 @@ void vTxMsgCanTask(void *pvParameters){
 					msg[2] = 'F';
 					msg[3] = 'F';
 				}
+				if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0)
+					HAL_CAN_AddTxMessage(&hcan1, &hdr, msg, &mailbox);
+			}
+			else if ( ( uxBits & TOF_MESURED_EVT ) != 0 ) {
+				msg[0] = 'E';
+				msg[1] = 'S';
+				Q8 q8_measure;
+				q8_measure.dec = 0;
+				q8_measure.integer = Tof_measure;
+				q8_to_bytes(q8_measure, &msg[2]);
+				msg[6] = TOF_SEND_ID;
 				if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0)
 					HAL_CAN_AddTxMessage(&hcan1, &hdr, msg, &mailbox);
 			}
@@ -892,10 +1105,42 @@ void vFanTask( void *pvParameters ){
 				htim2.Instance->CCR1 = rotationspeed;
 				update_fan();
 			}
-
-			vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(250));
 		}
+		vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(250));
 	}
+}
+
+void vReadTofTask(void *pvParameters) {
+	ResetAndInitializeTOF1();
+	ResetAndInitializeTOF2();
+	TickType_t xLastWakeTime;
+	xLastWakeTime = xTaskGetTickCount();
+
+	while (1) {
+
+		uint8_t ready;
+		VL53L1_Error err;
+
+		xSemaphoreTake(i2c_sem, portMAX_DELAY);
+
+		if ((err = VL53L1_GetMeasurementDataReady(&devRight, &ready)) == VL53L1_ERROR_NONE && ready) {
+//		if (VL53L1_GetMeasurementDataReady(&devRight, &ready), ready) {
+			VL53L1_RangingMeasurementData_t measure;
+			if (VL53L1_GetRangingMeasurementData(&devRight, &measure) != VL53L1_ERROR_NONE) {
+//				printf("Failed to read TOF stop\r\n");
+			} else {
+				if (measure.RangeStatus == 0 || measure.RangeStatus == 5 ){
+					Tof_measure = measure.RangeMilliMeter ;
+					xEventGroupSetBits(update_time_evt_grp, TOF_MESURED_EVT);
+				}
+			}
+		}
+//		VL53L1_ClearInterruptAndStartMeasurement(&devRight);
+		xSemaphoreGive(i2c_sem);
+
+		vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(TOF_INTERVAL));
+	}
+
 }
 
 
