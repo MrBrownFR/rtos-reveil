@@ -25,18 +25,46 @@
 #include "retarget.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include "ssd1306.h"
+#include <stdbool.h>
+//#include "ssd1306.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef enum { DROITE, GAUCHE } Sens_t;
+struct temps {
+	unsigned char  heure;
+	unsigned char  min;
+	unsigned char  sec;
+};
+
+typedef struct {
+	int32_t integer :24;
+	uint32_t dec :8;
+} Q8;
+
+typedef enum {
+	NORMAL, ALARM,
+} ScreenMode;
+
+typedef enum {
+	OK, AUTO, MAN,
+} DriveMode;
+
+typedef struct {
+	DriveMode mode;
+	Q8 val;
+} SensorState;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define POS_MIN  -3000
 #define POS_MAX   3000
+#define CAN_ID_MASTER  0x00
+
+#define HOUR_CHANGED_EVT (1 << 0)
+#define ALARM_CHANGED_EVT (1 << 1)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,12 +75,13 @@ typedef enum { DROITE, GAUCHE } Sens_t;
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 
-I2C_HandleTypeDef hi2c1;
+CAN_HandleTypeDef hcan1;
+
+UART_HandleTypeDef hlpuart1;
+UART_HandleTypeDef huart2;
 
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim5;
-
-UART_HandleTypeDef huart2;
 
 osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
@@ -65,20 +94,40 @@ int32_t enc_pos;
 Sens_t sens = DROITE;
 
 int32_t pos;
+struct temps horloge = 	{ 0, 0, 0 };
+
+struct {
+	struct temps val;
+	bool set;
+} alarm = { 0 };
+
+static uint8_t rxUART_byte;
+QueueHandle_t rxUARTQueue;
+
+QueueHandle_t rxCANQueue;
+
+EventGroupHandle_t update_time_evt_grp;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
-static void MX_I2C1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM5_Init(void);
+static void MX_LPUART1_UART_Init(void);
+static void MX_CAN1_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
 void motorspeed( void *pvParameters );
+void edit_time( void *pvParameters );
+void vHandleMsgTask( void* pvParameters);
+void vCanSendTask(void *pvParameters);
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
+//void receive(char a);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -116,11 +165,14 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART2_UART_Init();
-  MX_I2C1_Init();
   MX_TIM2_Init();
   MX_ADC1_Init();
   MX_TIM5_Init();
+  MX_LPUART1_UART_Init();
+  MX_CAN1_Init();
   /* USER CODE BEGIN 2 */
+  RetargetInit(&hlpuart1);
+  HAL_UART_Receive_IT(&hlpuart1, &rxUART_byte, 1);
 
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
   htim2.Instance->CCR1 = 0;
@@ -132,10 +184,18 @@ int main(void)
   // Lecture (le cast en int32_t donne les positions négatives)
   enc_pos = (int32_t)__HAL_TIM_GET_COUNTER(&htim5);
 
+  HAL_CAN_Start(&hcan1);
+  HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
   /* USER CODE END 2 */
 
-  /* USER CODE BEGIN RTOS_MUTEX */
+   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
+  update_time_evt_grp = xEventGroupCreate();
+  if (update_time_evt_grp == NULL) {
+  		char msg[] = "Error allocating update_time_evt_grp\r\n";
+  		HAL_UART_Transmit(&huart2, msg, sizeof(msg), HAL_MAX_DELAY);
+  		return 1;
+  	}
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -148,11 +208,24 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
+  rxUARTQueue = xQueueCreate(32, sizeof(uint8_t));
+  if (rxUARTQueue == NULL) {
+    		char msg[] = "Error allocating rxUARTQueue\r\n";
+    		HAL_UART_Transmit(&huart2, msg, sizeof(msg), HAL_MAX_DELAY);
+    		return 1;
+    }
+
+  rxCANQueue = xQueueCreate(5, sizeof(char) * 8);
+  if (rxCANQueue == NULL) {
+  		char msg[] = "Error allocating rxCANQueue\r\n";
+  		HAL_UART_Transmit(&huart2, msg, sizeof(msg), HAL_MAX_DELAY);
+  		return 1;
+  }
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 128);
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 512);
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
 
@@ -165,6 +238,26 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
+  xTaskCreate(		edit_time,       /* Function that implements the task. */
+                    "TIME EDITION",          /* Text name for the task. */
+                    1024,      /* Stack size in words, not bytes. */
+                    NULL,    /* Parameter passed into the task. */
+                    tskIDLE_PRIORITY+2,/* Priority at which the task is created. */
+                    NULL );      /* Used to pass out the created task's handle. */
+
+	xTaskCreate(	vHandleMsgTask, /* Function that implements the task. */
+					"Handle message from CAN", /* Text name for the task. */
+					1024, /* Stack size in words, not bytes. */
+					NULL, /* Parameter passed into the task. */
+					tskIDLE_PRIORITY + 3, /* Priority at which the task is created. */
+					NULL); /* Used to pass out the created task's handle. */
+
+	xTaskCreate(vCanSendTask,	/* Function that implements the task. */
+			  "Send Msg throught Can",          /* Text name for the task. */
+	          1024,      /* Stack size in words, not bytes. */
+	          NULL,    /* Parameter passed into the task. */
+			  tskIDLE_PRIORITY+1,/* Priority at which the task is created. */
+	          NULL );
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
@@ -199,10 +292,16 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
+  /** Configure LSE Drive Capability
+  */
+  HAL_PWR_EnableBkUpAccess();
+  __HAL_RCC_LSEDRIVE_CONFIG(RCC_LSEDRIVE_LOW);
+
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSE;
+  RCC_OscInitStruct.LSEState = RCC_LSE_ON;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -300,50 +399,108 @@ static void MX_ADC1_Init(void)
 }
 
 /**
-  * @brief I2C1 Initialization Function
+  * @brief CAN1 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_I2C1_Init(void)
+static void MX_CAN1_Init(void)
 {
 
-  /* USER CODE BEGIN I2C1_Init 0 */
+  /* USER CODE BEGIN CAN1_Init 0 */
 
-  /* USER CODE END I2C1_Init 0 */
+  /* USER CODE END CAN1_Init 0 */
 
-  /* USER CODE BEGIN I2C1_Init 1 */
+  /* USER CODE BEGIN CAN1_Init 1 */
 
-  /* USER CODE END I2C1_Init 1 */
-  hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x00F12981;
-  hi2c1.Init.OwnAddress1 = 0;
-  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c1.Init.OwnAddress2 = 0;
-  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
-  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  /* USER CODE END CAN1_Init 1 */
+  hcan1.Instance = CAN1;
+  hcan1.Init.Prescaler = 16;
+  hcan1.Init.Mode = CAN_MODE_NORMAL;
+  hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_3TQ;
+  hcan1.Init.TimeSeg2 = CAN_BS2_1TQ;
+  hcan1.Init.TimeTriggeredMode = DISABLE;
+  hcan1.Init.AutoBusOff = DISABLE;
+  hcan1.Init.AutoWakeUp = DISABLE;
+  hcan1.Init.AutoRetransmission = DISABLE;
+  hcan1.Init.ReceiveFifoLocked = DISABLE;
+  hcan1.Init.TransmitFifoPriority = DISABLE;
+  if (HAL_CAN_Init(&hcan1) != HAL_OK)
   {
     Error_Handler();
   }
+  /* USER CODE BEGIN CAN1_Init 2 */
 
-  /** Configure Analogue filter
+  /* USER CODE END CAN1_Init 2 */
+
+}
+
+/**
+  * @brief LPUART1 Initialization Function
+  * @param None
+  * @retval None
   */
-  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+static void MX_LPUART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN LPUART1_Init 0 */
+
+  /* USER CODE END LPUART1_Init 0 */
+
+  /* USER CODE BEGIN LPUART1_Init 1 */
+
+  /* USER CODE END LPUART1_Init 1 */
+  hlpuart1.Instance = LPUART1;
+  hlpuart1.Init.BaudRate = 9600;
+  hlpuart1.Init.WordLength = UART_WORDLENGTH_8B;
+  hlpuart1.Init.StopBits = UART_STOPBITS_1;
+  hlpuart1.Init.Parity = UART_PARITY_NONE;
+  hlpuart1.Init.Mode = UART_MODE_TX_RX;
+  hlpuart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  hlpuart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  hlpuart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&hlpuart1) != HAL_OK)
   {
     Error_Handler();
   }
+  /* USER CODE BEGIN LPUART1_Init 2 */
 
-  /** Configure Digital filter
+  /* USER CODE END LPUART1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
   */
-  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN I2C1_Init 2 */
+  /* USER CODE BEGIN USART2_Init 2 */
 
-  /* USER CODE END I2C1_Init 2 */
+  /* USER CODE END USART2_Init 2 */
 
 }
 
@@ -442,41 +599,6 @@ static void MX_TIM5_Init(void)
   /* USER CODE BEGIN TIM5_Init 2 */
 
   /* USER CODE END TIM5_Init 2 */
-
-}
-
-/**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART2_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART2_Init 0 */
-
-  /* USER CODE END USART2_Init 0 */
-
-  /* USER CODE BEGIN USART2_Init 1 */
-
-  /* USER CODE END USART2_Init 1 */
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART2_Init 2 */
-
-  /* USER CODE END USART2_Init 2 */
 
 }
 
@@ -580,6 +702,209 @@ void motorspeed( void *pvParameters ){
 		vTaskDelayUntil(&xLastWakeTime, xFrequency);
 	}
 }
+
+/*----------------------------------------------------------------------------
+ *        Functions
+ *---------------------------------------------------------------------------*/
+
+// Reads characters until '\r' or '\n'. Returns false on timeout.
+static bool read_line(char *buf, size_t size, TickType_t timeout){
+  size_t n = 0;
+  uint8_t c;
+
+  while (xQueueReceive(rxUARTQueue, &c, timeout) == pdTRUE) {
+    if (c == '\r' || c == '\n') {
+      if (n == 0)
+    	  continue;      // ignore the leftover CR/LF that followed the 'H'
+      buf[n] = '\0';
+      return true;
+    }
+    if (n < size - 1)
+    	buf[n++] = (char)c;
+  }
+  return false;                  // timeout
+}
+
+// Accepts "HH:MM:SS" avec 24>HH>=0 , 60>MM>=0 et 60>SS>=0
+static bool parse_time(const char *s, int *h, int *m, int *sec){
+  int n = sscanf(s, " %d:%d:%d", h, m, sec);
+  if (n != 3)
+	  return false;
+  return (*h >= 0 && *h < 24) && (*m >= 0 && *m < 60) && (*sec >= 0 && *sec < 60);
+}
+
+/*----------------------------------------------------------------------------
+ *        Tasks
+ *---------------------------------------------------------------------------*/
+
+
+void edit_time(void *pvParameters)
+{
+  uint8_t c;
+  char line[16];
+  int h, m, s;
+
+  while (1) {
+    xQueueReceive(rxUARTQueue, &c, portMAX_DELAY);
+
+    if (c == 'H' || c == 'h') {
+      printf("Enter time (HH:MM:SS): \r\n");
+
+      if (!read_line(line, sizeof line, pdMS_TO_TICKS(20000))) {
+        printf("Timeout\r\n");
+      } else if (parse_time(line, &h, &m, &s)) {
+        horloge.heure = h;
+    	horloge.min = m;
+    	horloge.sec = s;
+        printf("Time set to %02d:%02d:%02d\r\n", h, m, s);
+        xEventGroupSetBits(update_time_evt_grp, HOUR_CHANGED_EVT);
+      } else {
+        printf("Invalid format\r\n");
+      }
+
+    }
+
+    if (c == 'A' || c == 'a' ) {
+          printf("Setup alarm (HH:MM:SS): \r\n");
+
+          if (!read_line(line, sizeof line, pdMS_TO_TICKS(20000))) {
+            printf("Timeout\r\n");
+          } else if (parse_time(line, &h, &m, &s)) {
+            alarm.val.heure = h;
+        	alarm.val.min = m;
+        	alarm.val.sec = s;
+        	alarm.set = true;
+            printf("Alarm set to %02d:%02d:%02d\r\n", h, m, s);
+            xEventGroupSetBits(update_time_evt_grp, ALARM_CHANGED_EVT);
+          } else {
+            printf("Invalid format\r\n");
+          }
+
+        }
+
+    if (c == 'O' || c == 'o'){
+    	alarm.set = false;
+    	xEventGroupSetBits(update_time_evt_grp, ALARM_CHANGED_EVT);
+    	printf("Alarm OFF \r\n");
+    }
+  }
+}
+
+void vCanSendTask(void *pvParameters){
+	HAL_CAN_Start(&hcan1);
+
+	static CAN_TxHeaderTypeDef hdr = {
+	        .StdId = CAN_ID_MASTER,
+	        .IDE   = CAN_ID_STD,
+	        .RTR   = CAN_RTR_DATA,
+	        .DLC   = 4,
+	        .TransmitGlobalTime = DISABLE
+	 };
+
+	EventBits_t uxBits;
+
+	uint32_t mailbox;
+	uint8_t  msg[8] = {0};
+
+	while (1){
+
+
+		uxBits = xEventGroupWaitBits(
+			update_time_evt_grp,   /* The event group being tested. */
+			HOUR_CHANGED_EVT | ALARM_CHANGED_EVT, /* The bits within the event group to wait for. */
+			pdTRUE,
+			pdFALSE,       /* Don't wait for both bits, either bit will do. */
+			pdMS_TO_TICKS(1000) );/* Wait a maximum of x ms for either bit to be set. */
+
+			if( ( uxBits & HOUR_CHANGED_EVT ) != 0 )
+			{
+				msg[0] = 'T';
+				msg[1] = horloge.heure;
+				msg[2] = horloge.min;
+				msg[3] = horloge.sec;
+				if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0)
+				        HAL_CAN_AddTxMessage(&hcan1, &hdr, msg, &mailbox);
+			}
+			else if( ( uxBits & ALARM_CHANGED_EVT ) != 0 )
+			{
+				msg[0] = 'A';
+				if (alarm.set){
+					msg[1] = alarm.val.heure;
+					msg[2] = alarm.val.min;
+					msg[3] = alarm.val.sec;
+				} else {
+					msg[1] = 'O';
+					msg[2] = 'F';
+					msg[3] = 'F';
+				}
+				if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0)
+					HAL_CAN_AddTxMessage(&hcan1, &hdr, msg, &mailbox);
+			}
+	}
+}
+
+void vHandleMsgTask(void *parameters) {
+	char message[8];
+	while (1) {
+		xQueueReceive(rxCANQueue, message, portMAX_DELAY);
+
+		/* Environmental data */
+		if (message[0] == 'E') {
+			switch (message[1]) {
+				case 'A':
+					if (message[6] == 1){
+						/* Ventiler (Aérer) */
+					}
+					break;
+				case 'T':
+					if (message[6] == 1){
+						/* Balayer (Rafraichir) */
+					}
+					break;
+				case 'S':
+					break;
+				default:
+					break;
+			}
+		}
+	}
+}
+
+/*----------------------------------------------------------------------------
+ *        Callbacks
+ *---------------------------------------------------------------------------*/
+
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
+	CAN_RxHeaderTypeDef hdr;
+	uint8_t data[9];
+	HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &hdr, data);
+	data[8] = hdr.DLC & 0x1F;
+	BaseType_t task_woken;
+	xQueueSendFromISR(rxCANQueue, data, &task_woken);
+	portYIELD_FROM_ISR(task_woken);
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+  if (huart->Instance == hlpuart1.Instance) {
+
+    BaseType_t woken = pdFALSE;
+    //If sending to the queue unblocks a task whose priority is higher than the interrupted task, FreeRTOS sets woken to pdTRUE. Otherwise it leaves it at pdFALSE
+
+    xQueueSendFromISR(rxUARTQueue, &rxUART_byte, &woken);
+    HAL_UART_Receive_IT(huart, &rxUART_byte, 1);   // re-arm immediately
+
+    portYIELD_FROM_ISR(woken);
+    //If woken == pdTRUE, it requests a context switch right when the ISR exits, so the higher-priority task runs immediately.
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+  if (huart->Instance == hlpuart1.Instance) {
+    __HAL_UART_CLEAR_OREFLAG(huart);
+    HAL_UART_Receive_IT(huart, &rxUART_byte, 1);   // restart after any error
+  }
+}
+
 
 /* USER CODE END 4 */
 
