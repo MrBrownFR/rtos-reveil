@@ -32,6 +32,7 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef enum { DROITE, GAUCHE } Sens_t;
+
 struct temps {
 	unsigned char  heure;
 	unsigned char  min;
@@ -59,8 +60,8 @@ typedef struct {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define POS_MIN  -3000
-#define POS_MAX   3000
+#define POS_MIN -2000
+#define POS_MAX 2000
 #define CAN_ID_MASTER  0x00
 
 #define HOUR_CHANGED_EVT (1 << 0)
@@ -85,14 +86,13 @@ TIM_HandleTypeDef htim5;
 
 osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
-char Oled[20];
-char Retro =1;
-//
 uint32_t potent_value;
 
 int32_t enc_pos;
 Sens_t sens = DROITE;
 
+bool IS_COOLING = false;
+bool IS_REFRESHING_AUTO = false;
 int32_t pos;
 struct temps horloge = 	{ 0, 0, 0 };
 
@@ -122,7 +122,7 @@ static void MX_CAN1_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
-void motorspeed( void *pvParameters );
+void vMotorspeedTask( void *pvParameters );
 void edit_time( void *pvParameters );
 void vHandleMsgTask( void* pvParameters);
 void vCanSendTask(void *pvParameters);
@@ -188,7 +188,7 @@ int main(void)
   HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
   /* USER CODE END 2 */
 
-   /* USER CODE BEGIN RTOS_MUTEX */
+  /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
   update_time_evt_grp = xEventGroupCreate();
   if (update_time_evt_grp == NULL) {
@@ -225,16 +225,8 @@ int main(void)
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 512);
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 128);
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
-
-
-  xTaskCreate(      motorspeed,       /* Function that implements the task. */
-                      "Vitesse du moteur",          /* Text name for the task. */
-                      1024,      /* Stack size in words, not bytes. */
-                      NULL,    /* Parameter passed into the task. */
-                      tskIDLE_PRIORITY+1,/* Priority at which the task is created. */
-                      NULL );      /* Used to pass out the created task's handle. */
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -252,12 +244,20 @@ int main(void)
 					tskIDLE_PRIORITY + 3, /* Priority at which the task is created. */
 					NULL); /* Used to pass out the created task's handle. */
 
-	xTaskCreate(vCanSendTask,	/* Function that implements the task. */
+	xTaskCreate(	vCanSendTask,	/* Function that implements the task. */
 			  "Send Msg throught Can",          /* Text name for the task. */
 	          1024,      /* Stack size in words, not bytes. */
 	          NULL,    /* Parameter passed into the task. */
 			  tskIDLE_PRIORITY+1,/* Priority at which the task is created. */
 	          NULL );
+
+	xTaskCreate(      vMotorspeedTask,       /* Function that implements the task. */
+	          "Vitesse du moteur",          /* Text name for the task. */
+	           1024,      /* Stack size in words, not bytes. */
+	           NULL,    /* Parameter passed into the task. */
+	           tskIDLE_PRIORITY+1,/* Priority at which the task is created. */
+	           NULL );      /* Used to pass out the created task's handle. */
+
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
@@ -621,23 +621,16 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, LED2_Pin|DIR_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, LED5_Pin|DIS_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, LED5_Pin|DIS_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(DIR_GPIO_Port, DIR_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : LED2_Pin DIR_Pin */
-  GPIO_InitStruct.Pin = LED2_Pin|DIR_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pins : LED5_Pin DIS_Pin */
   GPIO_InitStruct.Pin = LED5_Pin|DIS_Pin;
@@ -651,6 +644,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(SW2_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : DIR_Pin */
+  GPIO_InitStruct.Pin = DIR_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(DIR_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : SW1_Pin */
   GPIO_InitStruct.Pin = SW1_Pin;
@@ -669,43 +669,21 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void balayage()
-{
-    pos = (int32_t)__HAL_TIM_GET_COUNTER(&htim5);
+/*----------------------------------------------------------------------------
+ *        Functions
+ *---------------------------------------------------------------------------*/
 
+void update_fan()
+{
+
+
+    if (!IS_COOLING){
+    	pos = (int32_t)__HAL_TIM_GET_COUNTER(&htim5);
+    }
     if (sens == DROITE && pos <= POS_MIN) sens = GAUCHE;
     else if (sens == GAUCHE && pos >= POS_MAX) sens = DROITE;
     HAL_GPIO_WritePin(DIR_GPIO_Port, DIR_Pin, sens);
 }
-
-void motorspeed( void *pvParameters ){
-
-	  TickType_t xLastWakeTime;
-	  const TickType_t xFrequency = 500 / portTICK_RATE_MS;
-
-
-	  xLastWakeTime = xTaskGetTickCount();
-
-	while(1){
-		potent_value = HAL_ADC_GetValue(&hadc1);
-
-		sprintf( Oled, "%d", potent_value );
-		SSD1306_GotoXY (0,30);
-		SSD1306_Puts (Oled, &Font_11x18, Retro);
-		SSD1306_UpdateScreen();
-		HAL_ADC_Start(&hadc1);
-
-		int rotationspeed = htim2.Instance->ARR * potent_value / 4036;
-		htim2.Instance->CCR1 = rotationspeed;
-		balayage();
-
-		vTaskDelayUntil(&xLastWakeTime, xFrequency);
-	}
-}
-
-/*----------------------------------------------------------------------------
- *        Functions
- *---------------------------------------------------------------------------*/
 
 // Reads characters until '\r' or '\n'. Returns false on timeout.
 static bool read_line(char *buf, size_t size, TickType_t timeout){
@@ -846,7 +824,7 @@ void vCanSendTask(void *pvParameters){
 void vHandleMsgTask(void *parameters) {
 	char message[8];
 	while (1) {
-		xQueueReceive(rxCANQueue, message, portMAX_DELAY);
+		xQueueReceive(rxCANQueue, message, pdMS_TO_TICKS(10));
 
 		/* Environmental data */
 		if (message[0] == 'E') {
@@ -854,11 +832,17 @@ void vHandleMsgTask(void *parameters) {
 				case 'A':
 					if (message[6] == 1){
 						/* Ventiler (Aérer) */
-					}
+						IS_COOLING = true;
+
+					} else IS_COOLING = false;
 					break;
 				case 'T':
 					if (message[6] == 1){
 						/* Balayer (Rafraichir) */
+						IS_REFRESHING_AUTO = true;
+
+					} else {
+						IS_REFRESHING_AUTO = false;
 					}
 					break;
 				case 'S':
@@ -869,6 +853,32 @@ void vHandleMsgTask(void *parameters) {
 		}
 	}
 }
+
+void vMotorspeedTask( void *pvParameters ){
+
+	  TickType_t xLastWakeTime;
+
+	  xLastWakeTime = xTaskGetTickCount();
+
+	while(1){
+
+		if (IS_COOLING){
+			htim2.Instance->CCR1 = 80000;
+		} else {
+			if(IS_REFRESHING_AUTO){
+				htim2.Instance->CCR1 = 80000;
+			} else {
+				potent_value = HAL_ADC_GetValue(&hadc1);
+				HAL_ADC_Start(&hadc1);
+				uint32_t rotationspeed = htim2.Instance->ARR * potent_value / 4021;
+				htim2.Instance->CCR1 = rotationspeed;
+			}
+			update_fan();
+			vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
+		}
+	}
+}
+
 
 /*----------------------------------------------------------------------------
  *        Callbacks
