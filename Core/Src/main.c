@@ -54,8 +54,8 @@ typedef struct {
 
 #define CAN_ID_SENSORS  0x01
 
-#define VOC_BAD_ON    200   // passe en "mauvais" au-dessus de ce seuil
-#define VOC_BAD_OFF   290   // repasse en "normal" sous ce seuil (hystérésis)
+#define VOC_BAD_ON    150   // passe en "mauvais" au-dessus de ce seuil
+#define VOC_BAD_OFF   125   // repasse en "normal" sous ce seuil (hystérésis)
 #define VOC_BAD_COUNT 3     // nombre de mesures consécutives avant de déclencher
 
 #define TEMP_BAD_ON     25
