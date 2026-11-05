@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include "math.h"
 //#include "ssd1306.h"
 /* USER CODE END Includes */
 
@@ -60,8 +61,8 @@ typedef struct {
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define POS_MIN -2000
-#define POS_MAX 2000
+#define POS_MIN 1500
+#define POS_MAX 4000
 #define CAN_ID_MASTER  0x00
 
 #define HOUR_CHANGED_EVT (1 << 0)
@@ -88,12 +89,13 @@ osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
 uint32_t potent_value;
 
-int32_t enc_pos;
-Sens_t sens = DROITE;
 
 bool IS_COOLING = false;
 bool IS_REFRESHING_AUTO = false;
-int32_t pos;
+
+Sens_t sens = DROITE;
+int32_t enc_pos = 2500 ;
+
 struct temps horloge = 	{ 0, 0, 0 };
 
 struct {
@@ -127,6 +129,7 @@ void edit_time( void *pvParameters );
 void vHandleMsgTask( void* pvParameters);
 void vCanSendTask(void *pvParameters);
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan);
 //void receive(char a);
 /* USER CODE END PFP */
 
@@ -430,7 +433,19 @@ static void MX_CAN1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN CAN1_Init 2 */
-
+  CAN_FilterTypeDef can_config = {
+		  .FilterIdHigh = 0x01 << 5,
+		  .FilterIdLow = 0x01,
+		  .FilterMaskIdLow = 0x01,
+		  .FilterMaskIdHigh = 0x0,
+		  .FilterMode =  		CAN_FILTERMODE_IDLIST,
+		  .FilterScale =  		CAN_FILTERSCALE_16BIT,
+		  .FilterActivation =  			CAN_FILTER_ENABLE,
+		  .FilterFIFOAssignment =  			CAN_FILTER_FIFO0,
+		  .FilterBank = 0,
+		  .SlaveStartFilterBank = 0,
+  };
+  	HAL_CAN_ConfigFilter(&hcan1, &can_config);
   /* USER CODE END CAN1_Init 2 */
 
 }
@@ -574,7 +589,7 @@ static void MX_TIM5_Init(void)
   htim5.Instance = TIM5;
   htim5.Init.Prescaler = 0;
   htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim5.Init.Period = 4294967295;
+  htim5.Init.Period = 5320;
   htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
@@ -673,15 +688,14 @@ static void MX_GPIO_Init(void)
  *        Functions
  *---------------------------------------------------------------------------*/
 
-void update_fan()
-{
+void update_fan() {
+    enc_pos = (int32_t) __HAL_TIM_GET_COUNTER(&htim5);
 
+    if (enc_pos <= POS_MIN)
+        sens = GAUCHE;
+    if (enc_pos >= POS_MAX)
+        sens = DROITE;
 
-    if (!IS_COOLING){
-    	pos = (int32_t)__HAL_TIM_GET_COUNTER(&htim5);
-    }
-    if (sens == DROITE && pos <= POS_MIN) sens = GAUCHE;
-    else if (sens == GAUCHE && pos >= POS_MAX) sens = DROITE;
     HAL_GPIO_WritePin(DIR_GPIO_Port, DIR_Pin, sens);
 }
 
@@ -832,17 +846,20 @@ void vHandleMsgTask(void *parameters) {
 				case 'A':
 					if (message[6] == 1){
 						/* Ventiler (Aérer) */
-						IS_COOLING = true;
-
-					} else IS_COOLING = false;
-					break;
-				case 'T':
-					if (message[6] == 1){
-						/* Balayer (Rafraichir) */
 						IS_REFRESHING_AUTO = true;
 
 					} else {
 						IS_REFRESHING_AUTO = false;
+						enc_pos = 2500;
+					}
+					break;
+				case 'T':
+					if (message[6] == 1){
+						/* Balayer (Rafraichir) */
+						IS_COOLING = true;
+
+					} else {
+						IS_COOLING = false;
 					}
 					break;
 				case 'S':
@@ -863,18 +880,20 @@ void vMotorspeedTask( void *pvParameters ){
 	while(1){
 
 		if (IS_COOLING){
-			htim2.Instance->CCR1 = 80000;
+			htim2.Instance->CCR1 = htim2.Instance->ARR;
 		} else {
 			if(IS_REFRESHING_AUTO){
-				htim2.Instance->CCR1 = 80000;
+				htim2.Instance->CCR1 = htim2.Instance->ARR;
+				update_fan();
 			} else {
 				potent_value = HAL_ADC_GetValue(&hadc1);
 				HAL_ADC_Start(&hadc1);
 				uint32_t rotationspeed = htim2.Instance->ARR * potent_value / 4021;
 				htim2.Instance->CCR1 = rotationspeed;
+				update_fan();
 			}
-			update_fan();
-			vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(500));
+
+			vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(250));
 		}
 	}
 }
