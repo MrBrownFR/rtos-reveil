@@ -93,7 +93,7 @@ static void MX_CAN1_Init(void);
 /* USER CODE BEGIN PFP */
 
 void vSensorTask(void *pvParameters);
-void vCanTask(void *pvParameters);
+void vTxCanTask(void *pvParameters);
 
 /* USER CODE END PFP */
 
@@ -167,7 +167,7 @@ int main(void)
                       tskIDLE_PRIORITY+1,/* Priority at which the task is created. */
                       NULL );      /* Used to pass out the created task's handle. */
 
-  xTaskCreate(vCanTask,	/* Function that implements the task. */
+  xTaskCreate(vTxCanTask,	/* Function that implements the task. */
 		  "Bus Can",          /* Text name for the task. */
           512,      /* Stack size in words, not bytes. */
           NULL,    /* Parameter passed into the task. */
@@ -548,7 +548,7 @@ void vSensorTask(void *pvParameters)
     }
 }
 
-void vCanTask(void *pv)
+void vTxCanTask(void *pv)
 {
     SensorData_t d;
 
