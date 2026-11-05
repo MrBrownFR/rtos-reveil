@@ -124,10 +124,10 @@ static void MX_CAN1_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
-void vMotorspeedTask( void *pvParameters );
-void edit_time( void *pvParameters );
-void vHandleMsgTask( void* pvParameters);
-void vCanSendTask(void *pvParameters);
+void vFanTask( void *pvParameters );
+void vEditTimeTask( void *pvParameters );
+void vRxMsgCanTask( void* pvParameters);
+void vTxMsgCanTask(void *pvParameters);
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan);
 //void receive(char a);
@@ -233,28 +233,28 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
-  xTaskCreate(		edit_time,       /* Function that implements the task. */
+  xTaskCreate(		vEditTimeTask,       /* Function that implements the task. */
                     "TIME EDITION",          /* Text name for the task. */
                     1024,      /* Stack size in words, not bytes. */
                     NULL,    /* Parameter passed into the task. */
-                    tskIDLE_PRIORITY+2,/* Priority at which the task is created. */
+                    tskIDLE_PRIORITY+3,/* Priority at which the task is created. */
                     NULL );      /* Used to pass out the created task's handle. */
 
-	xTaskCreate(	vHandleMsgTask, /* Function that implements the task. */
+	xTaskCreate(	vRxMsgCanTask, /* Function that implements the task. */
 					"Handle message from CAN", /* Text name for the task. */
 					1024, /* Stack size in words, not bytes. */
 					NULL, /* Parameter passed into the task. */
-					tskIDLE_PRIORITY + 3, /* Priority at which the task is created. */
+					tskIDLE_PRIORITY + 2, /* Priority at which the task is created. */
 					NULL); /* Used to pass out the created task's handle. */
 
-	xTaskCreate(	vCanSendTask,	/* Function that implements the task. */
+	xTaskCreate(	vTxMsgCanTask,	/* Function that implements the task. */
 			  "Send Msg throught Can",          /* Text name for the task. */
 	          1024,      /* Stack size in words, not bytes. */
 	          NULL,    /* Parameter passed into the task. */
-			  tskIDLE_PRIORITY+1,/* Priority at which the task is created. */
+			  tskIDLE_PRIORITY+2,/* Priority at which the task is created. */
 	          NULL );
 
-	xTaskCreate(      vMotorspeedTask,       /* Function that implements the task. */
+	xTaskCreate(      vFanTask,       /* Function that implements the task. */
 	          "Vitesse du moteur",          /* Text name for the task. */
 	           1024,      /* Stack size in words, not bytes. */
 	           NULL,    /* Parameter passed into the task. */
@@ -730,7 +730,7 @@ static bool parse_time(const char *s, int *h, int *m, int *sec){
  *---------------------------------------------------------------------------*/
 
 
-void edit_time(void *pvParameters)
+void vEditTimeTask(void *pvParameters)
 {
   uint8_t c;
   char line[16];
@@ -782,7 +782,7 @@ void edit_time(void *pvParameters)
   }
 }
 
-void vCanSendTask(void *pvParameters){
+void vTxMsgCanTask(void *pvParameters){
 	HAL_CAN_Start(&hcan1);
 
 	static CAN_TxHeaderTypeDef hdr = {
@@ -835,7 +835,7 @@ void vCanSendTask(void *pvParameters){
 	}
 }
 
-void vHandleMsgTask(void *parameters) {
+void vRxMsgCanTask(void *parameters) {
 	char message[8];
 	while (1) {
 		xQueueReceive(rxCANQueue, message, pdMS_TO_TICKS(10));
@@ -871,7 +871,7 @@ void vHandleMsgTask(void *parameters) {
 	}
 }
 
-void vMotorspeedTask( void *pvParameters ){
+void vFanTask( void *pvParameters ){
 
 	  TickType_t xLastWakeTime;
 
