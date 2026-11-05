@@ -54,8 +54,8 @@ typedef struct {
 
 #define CAN_ID_SENSORS  0x01
 
-#define VOC_BAD_ON    80 // 150   // passe en "mauvais" au-dessus de ce seuil
-#define VOC_BAD_OFF   70 // 130   // repasse en "normal" sous ce seuil (hystérésis)
+#define VOC_BAD_ON    100 // 150   // passe en "mauvais" au-dessus de ce seuil
+#define VOC_BAD_OFF   90 // 130   // repasse en "normal" sous ce seuil (hystérésis)
 #define VOC_BAD_COUNT 3     // nombre de mesures consécutives avant de déclencher
 
 #define TEMP_BAD_ON     25
@@ -544,7 +544,7 @@ void vSensorTask(void *pvParameters)
         };
 
         xQueueSend(xSensorQueue, &d, pdMS_TO_TICKS(10));
-        vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(1000));
+        vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(2000));
     }
 }
 
@@ -556,7 +556,7 @@ void vCanTask(void *pv)
 
     while(1)
     {
-        if (xQueueReceive(xSensorQueue, &d, pdMS_TO_TICKS(1500)) == pdTRUE)
+        if (xQueueReceive(xSensorQueue, &d, pdMS_TO_TICKS(2000)) == pdTRUE)
         {
             // Température
             Q8 t;
