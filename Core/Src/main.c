@@ -27,19 +27,40 @@
 #include <stdbool.h>
 #include "fonts.h"
 #include "ssd1306.h"
+#include "SGP40.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+typedef struct {
+    int8_t    temp_MSB;
+    uint8_t    temp_LSB;
+    uint16_t voc_index;      // SRAW_VOC en ticks
+    bool     voc_valid;   // false si le SGP40 est absent ou en échec
+    bool     air_bad;     // true => déclencher l'aération
+} SensorData_t;
+
+    typedef struct {
+        int32_t integer :24;
+        uint32_t dec :8;
+    } Q8;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define AQ_ADRR 0x59
 #define TEMP_ADRR 0x80
-#define SENSOR_PERIOD_MS   1000
-#define SENSOR_CONV_MS     150
+
+#define CAN_ID_SENSORS  0x01
+
+#define VOC_BAD_ON    80 // 150   // passe en "mauvais" au-dessus de ce seuil
+#define VOC_BAD_OFF   70 // 130   // repasse en "normal" sous ce seuil (hystérésis)
+#define VOC_BAD_COUNT 3     // nombre de mesures consécutives avant de déclencher
+
+#define TEMP_BAD_ON     25
+#define TEMP_BAD_OFF     23
+#define TEMP_BAD_COUNT 3     // nombre de mesures consécutives avant de déclencher
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -48,27 +69,17 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+CAN_HandleTypeDef hcan1;
+
 I2C_HandleTypeDef hi2c1;
 
 SPI_HandleTypeDef hspi2;
 
-TIM_HandleTypeDef htim7;
-
 osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
 
-typedef struct {
-    int8_t    temp_MSB;
-    uint8_t    temp_LSB;
-    uint16_t voc_index;      // SRAW_VOC en ticks
-    bool     voc_valid;
-} SensorData_t;
-
 QueueHandle_t xSensorQueue;  // xQueueCreate(1, sizeof(SensorData_t))
 SemaphoreHandle_t xI2CMutex;
-
-static const uint8_t aq_cmd[8]      = {0x26, 0x0F, 0x80, 0x00, 0xA2, 0x66, 0x66, 0x93};
-static const uint8_t aq_selftest[2] = {0x28, 0x0E};
 
 /* USER CODE END PV */
 
@@ -77,13 +88,12 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI2_Init(void);
-static void MX_TIM7_Init(void);
-void StartDefaultTask(void const * argument);
+static void MX_CAN1_Init(void);
 
 /* USER CODE BEGIN PFP */
 
 void vSensorTask(void *pvParameters);
-void vOledTask(void *pvParameters);
+void vCanTask(void *pvParameters);
 
 /* USER CODE END PFP */
 
@@ -123,7 +133,7 @@ int main(void)
   MX_GPIO_Init();
   MX_I2C1_Init();
   MX_SPI2_Init();
-  MX_TIM7_Init();
+  MX_CAN1_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -147,36 +157,23 @@ int main(void)
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 512);
-  defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
-  BaseType_t r1 = xTaskCreate(      vSensorTask,       /* Function that implements the task. */
+  xTaskCreate(      vSensorTask,       /* Function that implements the task. */
                       "Sensors' reading",          /* Text name for the task. */
                       512,      /* Stack size in words, not bytes. */
                       NULL,    /* Parameter passed into the task. */
                       tskIDLE_PRIORITY+1,/* Priority at which the task is created. */
                       NULL );      /* Used to pass out the created task's handle. */
 
-  BaseType_t r2 =  xTaskCreate(      vOledTask,       /* Function that implements the task. */
-                      "Ecran",          /* Text name for the task. */
-                      512,      /* Stack size in words, not bytes. */
-                      NULL,    /* Parameter passed into the task. */
-					  tskIDLE_PRIORITY+1,/* Priority at which the task is created. */
-                      NULL );      /* Used to pass out the created task's handle. */
+  xTaskCreate(vCanTask,	/* Function that implements the task. */
+		  "Bus Can",          /* Text name for the task. */
+          512,      /* Stack size in words, not bytes. */
+          NULL,    /* Parameter passed into the task. */
+		  tskIDLE_PRIORITY+1,/* Priority at which the task is created. */
+          NULL );
 
-
-  SSD1306_Init();
-  char test_buff[4] = "Test";
-  SSD1306_GotoXY (0,30);
-  SSD1306_Puts (test_buff, &Font_11x18, 0);
-
-  volatile size_t heap_libre = xPortGetFreeHeapSize();   // à observer en Live Expressions
-  (void)r1; (void)r2;
-
-  SSD1306_UpdateScreen();
-//  vTaskStartScheduler();
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
@@ -243,6 +240,43 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief CAN1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CAN1_Init(void)
+{
+
+  /* USER CODE BEGIN CAN1_Init 0 */
+
+  /* USER CODE END CAN1_Init 0 */
+
+  /* USER CODE BEGIN CAN1_Init 1 */
+
+  /* USER CODE END CAN1_Init 1 */
+  hcan1.Instance = CAN1;
+  hcan1.Init.Prescaler = 16;
+  hcan1.Init.Mode = CAN_MODE_NORMAL;
+  hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_3TQ;
+  hcan1.Init.TimeSeg2 = CAN_BS2_1TQ;
+  hcan1.Init.TimeTriggeredMode = DISABLE;
+  hcan1.Init.AutoBusOff = DISABLE;
+  hcan1.Init.AutoWakeUp = DISABLE;
+  hcan1.Init.AutoRetransmission = DISABLE;
+  hcan1.Init.ReceiveFifoLocked = DISABLE;
+  hcan1.Init.TransmitFifoPriority = DISABLE;
+  if (HAL_CAN_Init(&hcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CAN1_Init 2 */
+
+  /* USER CODE END CAN1_Init 2 */
+
 }
 
 /**
@@ -328,47 +362,8 @@ static void MX_SPI2_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN SPI2_Init 2 */
-  HAL_GPIO_WritePin(CSN_GPIO_Port, CSN_Pin, 1); //CSN actif état bas -> On désactive
   HAL_GPIO_WritePin(CE_GPIO_Port, CE_Pin, GPIO_PIN_RESET); //CE actif état haut -> On désactive
   /* USER CODE END SPI2_Init 2 */
-
-}
-
-/**
-  * @brief TIM7 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM7_Init(void)
-{
-
-  /* USER CODE BEGIN TIM7_Init 0 */
-
-  /* USER CODE END TIM7_Init 0 */
-
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM7_Init 1 */
-
-  /* USER CODE END TIM7_Init 1 */
-  htim7.Instance = TIM7;
-  htim7.Init.Prescaler = 1280-1;
-  htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim7.Init.Period = 62500-1;
-  htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim7) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim7, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM7_Init 2 */
-
-  /* USER CODE END TIM7_Init 2 */
 
 }
 
@@ -394,7 +389,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, CE_Pin|CSN_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(CE_GPIO_Port, CE_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
@@ -417,12 +412,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : CE_Pin CSN_Pin */
-  GPIO_InitStruct.Pin = CE_Pin|CSN_Pin;
+  /*Configure GPIO pin : CE_Pin */
+  GPIO_InitStruct.Pin = CE_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(CE_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 5, 0);
@@ -444,133 +439,137 @@ void sensor_write_reg(uint8_t addr, uint8_t val)
     HAL_GPIO_WritePin(CE_GPIO_Port, CE_Pin, GPIO_PIN_RESET);
 }
 
-uint8_t sensor_read_reg(uint8_t addr)
+void sensor_read_reg(uint8_t addr, uint8_t *rx_buffer)
 {
-    uint8_t rx = 0;
     HAL_GPIO_WritePin(CE_GPIO_Port, CE_Pin, GPIO_PIN_SET);
     HAL_SPI_Transmit(&hspi2, &addr, 1, 10);
-    HAL_SPI_Receive(&hspi2, &rx, 1, 10);
+    HAL_SPI_Receive(&hspi2, rx_buffer, 3, 10);
     HAL_GPIO_WritePin(CE_GPIO_Port, CE_Pin, GPIO_PIN_RESET);
-    return rx;
 }
 
-static void format_temp(char *out, size_t n, float t)
+// Filtre anti-rebond : renvoie l'état "air mauvais"
+static bool update_air_bad(uint16_t voc)
 {
-    // Évite %f (non activé par défaut avec newlib-nano)
-    int t10 = (int)(t * 10.0f + (t >= 0 ? 0.5f : -0.5f));
-    int a = t10 < 0 ? -t10 : t10;
-    snprintf(out, n, "Temp: %s%d.%d C", t10 < 0 ? "-" : "", a / 10, a % 10);
-}
+    static bool     bad = false;
+    static uint8_t  cnt = 0;
 
-// CRC8 Sensirion (poly 0x31, init 0xFF)
-static uint8_t crc8(const uint8_t *d, size_t n)
-{
-    uint8_t crc = 0xFF;
-    for (size_t i = 0; i < n; i++) {
-        crc ^= d[i];
-        for (int b = 0; b < 8; b++)
-            crc = (crc & 0x80) ? (crc << 1) ^ 0x31 : (crc << 1);
+    if (voc == 0) return bad;            // phase d'init : on ne change rien
+
+    if (!bad) {
+        cnt = (voc > VOC_BAD_ON) ? cnt + 1 : 0;
+        if (cnt >= VOC_BAD_COUNT) { bad = true; cnt = 0; }
+    } else if (voc < VOC_BAD_OFF) {
+        bad = false;
     }
-    return crc;
+    return bad;
 }
 
-static bool aq_self_test(void)
+// Filtre anti-rebond : renvoie l'état "température trop haute"
+static bool update_temp_bad(int8_t temp_MSB)
 {
-    uint8_t rx[3];
-    xSemaphoreTake(xI2CMutex, portMAX_DELAY);
-    HAL_I2C_Master_Transmit(&hi2c1, AQ_ADRR << 1, (uint8_t *)aq_selftest, 2, 10);
-    xSemaphoreGive(xI2CMutex);
+    static bool     bad = false;
+    static uint8_t  cnt = 0;
 
-    vTaskDelay(pdMS_TO_TICKS(330));   // 320 ms + marge
+    if (!bad) {
+        cnt = (temp_MSB >= TEMP_BAD_ON) ? cnt + 1 : 0;
+        if (cnt >= TEMP_BAD_COUNT) { bad = true; cnt = 0; }
+    } else if (temp_MSB < TEMP_BAD_OFF) {
+        bad = false;
+    }
+    return bad;
+}
 
-    xSemaphoreTake(xI2CMutex, portMAX_DELAY);
-    HAL_StatusTypeDef st = HAL_I2C_Master_Receive(&hi2c1, AQ_ADRR << 1, rx, 3, 10);
-    xSemaphoreGive(xI2CMutex);
+// Écrit le Q8 sur 4 octets : 3 octets de partie entière (big-endian) puis 1 octet de décimale
+static void q8_to_bytes(Q8 v, uint8_t *p)
+{
+    int32_t i = v.integer;
+    p[0] = (uint8_t)( i        & 0xFF);   // poids faible en premier
+    p[1] = (uint8_t)((i >> 8)  & 0xFF);
+    p[2] = (uint8_t)((i >> 16) & 0xFF);
+    p[3] = (uint8_t)v.dec;
+}
 
-    return st == HAL_OK && crc8(rx, 2) == rx[2] && rx[0] == 0xD4;
+static HAL_StatusTypeDef can_send(char type, Q8 val, bool good)
+{
+    static CAN_TxHeaderTypeDef hdr = {
+        .StdId = CAN_ID_SENSORS,
+        .IDE   = CAN_ID_STD,
+        .RTR   = CAN_RTR_DATA,
+        .DLC   = 7,
+        .TransmitGlobalTime = DISABLE
+    };
+    uint8_t  msg[8] = {0};
+    uint32_t mailbox;
+
+    msg[0] = 'E';
+    msg[1] = (uint8_t)type;          // 'T' ou 'A'
+    q8_to_bytes(val, &msg[2]);       // octets 2 à 5
+    msg[6] = good ? 0 : 1;           // 0 = OK, 1 = AUTO (aération)
+
+    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0)
+        return HAL_BUSY;
+    return HAL_CAN_AddTxMessage(&hcan1, &hdr, msg, &mailbox);
 }
 /*----------------------------------------------------------------------------
  *        Task
  *---------------------------------------------------------------------------*/
 void vSensorTask(void *pvParameters)
 {
-    bool aq_ok = aq_self_test();      // une seule fois au démarrage
-    TickType_t xLastWake = xTaskGetTickCount();
+	bool aq_ok = (SGP40_Init() == 0);     // ~500 ms, appelé depuis la tâche
+	TickType_t xLastWake = xTaskGetTickCount();
+	float temp_prev = 25.0f;
 
     while(1)    {
 
-        sensor_write_reg(TEMP_ADRR, 0x15);                       // température (SPI)
+        sensor_write_reg(TEMP_ADRR, 0x15);                       // température (SPI)  (Need 150 ms)
 
-        if (aq_ok) {
-            xSemaphoreTake(xI2CMutex, portMAX_DELAY);
-            HAL_I2C_Master_Transmit(&hi2c1, AQ_ADRR << 1, (uint8_t *)aq_cmd, 8, 10); //Air Quality (I2C)
-            xSemaphoreGive(xI2CMutex);
-        }
+        uint16_t voc = 0;
+        if (aq_ok)
+            voc = SGP40_MeasureVOC(temp_prev, 50.0f);    // ~30 ms, compensée en température
 
-        vTaskDelay(160 / portTICK_RATE_MS);                     // couvre 150 ms (temp) et 30 ms (SGP40)
+        vTaskDelay(pdMS_TO_TICKS(150));                  // Ne pas mettre moins, sinon ça ne marche pas
 
-        SensorData_t d = {0};
+        uint8_t rxSpi[3] = {0};
+        sensor_read_reg( (uint8_t) 0x02, rxSpi);  //Reading Temp sensor (SPI)
 
-        //Reading Temp sensor (SPI)
-        uint8_t read_adrr = 0x02;
-        uint8_t rxSpi[3];
 
-        HAL_GPIO_WritePin(CE_GPIO_Port, CE_Pin, GPIO_PIN_SET);
-        HAL_SPI_Transmit(&hspi2, &read_adrr , 1, 10);
-        HAL_SPI_Receive(&hspi2, rxSpi, 3, 10);
-        HAL_GPIO_WritePin(CE_GPIO_Port, CE_Pin, GPIO_PIN_RESET);
+        temp_prev = (int8_t)rxSpi[0] + (rxSpi[1] >> 6) * 0.25f;   // compensation du SGP40
 
-        d.temp_LSB= (rxSpi[1] >> 6)*25 ;
-        d.temp_MSB = rxSpi[0] ;
+        SensorData_t d = {
+            .temp_MSB  = (int8_t)rxSpi[0],
+            .temp_LSB  = rxSpi[1],
+            .voc_index = voc,
+            .voc_valid = aq_ok,
+            .air_bad   = aq_ok && update_air_bad(voc)
+        };
 
-        if (aq_ok) {
-            uint8_t rx[3];
-            xSemaphoreTake(xI2CMutex, portMAX_DELAY);
-            HAL_StatusTypeDef st = HAL_I2C_Master_Receive(&hi2c1, AQ_ADRR << 1, rx, 3, 10);
-            xSemaphoreGive(xI2CMutex);
-
-            if (st == HAL_OK && crc8(rx, 2) == rx[2]) {
-                d.voc_index   = (rx[0] << 8) | rx[1];
-                d.voc_valid = true;
-            }
-        }
-
-        xQueueSend(xSensorQueue, &d, portMAX_DELAY);
-        vTaskDelayUntil(&xLastWake, 1000 / portTICK_RATE_MS);
+        xQueueSend(xSensorQueue, &d, pdMS_TO_TICKS(10));
+        vTaskDelayUntil(&xLastWake, pdMS_TO_TICKS(1000));
     }
 }
 
-void vOledTask(void *pvParameters)
+void vCanTask(void *pv)
 {
-    char line[24];
     SensorData_t d;
 
-    while (!SSD1306_Init()){
-    	vTaskDelay(pdMS_TO_TICKS(500));
-    }
-
+    HAL_CAN_Start(&hcan1);           // indispensable avant tout envoi
 
     while(1)
     {
-        bool got = (xQueueReceive(xSensorQueue, &d, pdMS_TO_TICKS(1500)) == pdTRUE);
+        if (xQueueReceive(xSensorQueue, &d, pdMS_TO_TICKS(1500)) == pdTRUE)
+        {
+            // Température
+            Q8 t;
+            t.integer = d.temp_MSB;
+            t.dec     = d.temp_LSB & 0xC0;
+            can_send('T', t, !update_temp_bad(d.temp_MSB));
 
-        if (got) {
-            //format_temp(line, sizeof(line), d.temperature);
-            sprintf(line, "Temp: %d.%u C  ", d.temp_MSB, d.temp_LSB);
-            SSD1306_GotoXY(0, 0);
-            SSD1306_Puts(line, &Font_7x10, SSD1306_COLOR_WHITE);
-
-            if (!d.voc_valid)          snprintf(line, sizeof(line), "VOC: erreur");
-            else if (d.voc_index == 0) snprintf(line, sizeof(line), "VOC: init...");
-            else                       snprintf(line, sizeof(line), "VOC: %u", d.voc_index);
-            SSD1306_GotoXY(0, 16);
-            SSD1306_Puts(line, &Font_7x10, SSD1306_COLOR_WHITE);
-        } else {
-            SSD1306_GotoXY(0, 0);  SSD1306_Puts("Temp: --", &Font_7x10, SSD1306_COLOR_WHITE);
-            SSD1306_GotoXY(0, 16); SSD1306_Puts("VOC: --",  &Font_7x10, SSD1306_COLOR_WHITE);
+            // Qualité d'air
+            Q8 a;
+            a.integer = d.voc_index;
+            a.dec     = 0;
+            can_send('A', a, d.voc_valid && !d.air_bad);
         }
-
-        SSD1306_UpdateScreen();
     }
 }
 
