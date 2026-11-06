@@ -28,6 +28,7 @@
 #include "fonts.h"
 #include "ssd1306.h"
 #include "SGP40.h"
+#include "../../Drivers/VL53L1_Nucleo/core/inc/vl53l1_api.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -39,6 +40,8 @@ typedef struct {
     uint16_t voc_index;      // SRAW_VOC en ticks
     bool     voc_valid;   // false si le SGP40 est absent ou en échec
     bool     air_bad;     // true => déclencher l'aération
+	bool tof_set;
+	int16_t tof_measure;
 } SensorData_t;
 
     typedef struct {
@@ -61,6 +64,9 @@ typedef struct {
 #define TEMP_BAD_ON     25
 #define TEMP_BAD_OFF     23
 #define TEMP_BAD_COUNT 3     // nombre de mesures consécutives avant de déclencher
+
+#define TOF_INTERVAL 10000	//5min : 5 * 60 * 1000 = 300 000s (pour le test, on met 10s soit 10 000ms)
+#define TOF_SEND_ID 0x10
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -81,6 +87,9 @@ osThreadId defaultTaskHandle;
 QueueHandle_t xSensorQueue;  // xQueueCreate(1, sizeof(SensorData_t))
 SemaphoreHandle_t xI2CMutex;
 
+VL53L1_Dev_t devLeft;
+VL53L1_Dev_t devRight;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -89,11 +98,13 @@ static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_CAN1_Init(void);
+void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
 
 void vSensorTask(void *pvParameters);
 void vTxCanTask(void *pvParameters);
+void vReadTofTask(void *pvParameters);
 
 /* USER CODE END PFP */
 
@@ -152,11 +163,13 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
-  xSensorQueue = xQueueCreate(1, sizeof(SensorData_t));
+  xSensorQueue = xQueueCreate(5, sizeof(SensorData_t));
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask */
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 512);
+  defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -173,6 +186,13 @@ int main(void)
           NULL,    /* Parameter passed into the task. */
 		  tskIDLE_PRIORITY+1,/* Priority at which the task is created. */
           NULL );
+		  
+	xTaskCreate(      vReadTofTask,       /* Function that implements the task. */
+		          "lecture des tof",          /* Text name for the task. */
+		           512,      /* Stack size in words, not bytes. */
+		           NULL,    /* Parameter passed into the task. */
+		           tskIDLE_PRIORITY+1,/* Priority at which the task is created. */
+		           NULL );      /* Used to pass out the created task's handle. */
 
   /* USER CODE END RTOS_THREADS */
 
@@ -386,7 +406,13 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOH, SHUT1_Pin|SHUT2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(INTOF1_GPIO_Port, INTOF1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(CE_GPIO_Port, CE_Pin, GPIO_PIN_RESET);
@@ -396,6 +422,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : SHUT1_Pin SHUT2_Pin */
+  GPIO_InitStruct.Pin = SHUT1_Pin|SHUT2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOH, &GPIO_InitStruct);
 
   /*Configure GPIO pins : USART_TX_Pin USART_RX_Pin */
   GPIO_InitStruct.Pin = USART_TX_Pin|USART_RX_Pin;
@@ -411,6 +444,19 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : INTOF2_Pin */
+  GPIO_InitStruct.Pin = INTOF2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(INTOF2_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : INTOF1_Pin */
+  GPIO_InitStruct.Pin = INTOF1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(INTOF1_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : CE_Pin */
   GPIO_InitStruct.Pin = CE_Pin;
@@ -430,6 +476,13 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+/*----------------------------------------------------------------------------
+ *        Functions
+ *---------------------------------------------------------------------------*/
+
+void HAL_Delay(uint32_t Delay) {
+	vTaskDelay(pdMS_TO_TICKS((Delay)));
+}
 
 void sensor_write_reg(uint8_t addr, uint8_t val)
 {
@@ -502,7 +555,7 @@ static HAL_StatusTypeDef can_send(char type, Q8 val, bool good)
     uint32_t mailbox;
 
     msg[0] = 'E';
-    msg[1] = (uint8_t)type;          // 'T' ou 'A'
+    msg[1] = (uint8_t)type;          // 'T' ou 'A' ou 'S'
     q8_to_bytes(val, &msg[2]);       // octets 2 à 5
     msg[6] = good ? 0 : 1;           // 0 = OK, 1 = AUTO (aération)
 
@@ -510,6 +563,106 @@ static HAL_StatusTypeDef can_send(char type, Q8 val, bool good)
         return HAL_BUSY;
     return HAL_CAN_AddTxMessage(&hcan1, &hdr, msg, &mailbox);
 }
+
+void ResetAndInitializeTOF1(void) {
+	VL53L1_DEV Dev;
+	VL53L1_DetectionConfig_t DetectionConfig;
+	uint8_t newI2C = 0x52;
+	/* Reset the 1 ToF sensors on the expansion board */
+	HAL_GPIO_WritePin(GPIOH, SHUT1_Pin, GPIO_PIN_RESET);
+	HAL_Delay(10);
+	/* Bring the sensors out of the reset stage one by one and set the new I2C address */
+	Dev = &devLeft;
+	HAL_GPIO_WritePin(GPIOH, SHUT1_Pin, GPIO_PIN_SET);
+	HAL_Delay(50);
+	Dev->comms_speed_khz = 400;
+	Dev->I2cHandle = &hi2c1;
+	Dev->comms_type = 1;
+	Dev->I2cDevAddr = 0x52;
+	VL53L1_SetDeviceAddress(Dev, newI2C);
+	Dev->I2cDevAddr = newI2C;
+	/* Device Initialization and setting */
+	VL53L1_WaitDeviceBooted(Dev);
+	VL53L1_DataInit(Dev);
+	VL53L1_StaticInit(Dev);
+	/* Vérification de l'identification du capteur */
+	uint8_t device_id = 0;
+	VL53L1_RdByte(Dev, 0x010F, &device_id);
+	char msg[30];
+	sprintf(msg, "TOF1 ID: 0x%02X\r\n", device_id);
+	//HAL_UART_Transmit(&huart2, msg, strlen(msg), HAL_MAX_DELAY);
+	VL53L1_SetDistanceMode(Dev, VL53L1_DISTANCEMODE_SHORT);
+	VL53L1_SetMeasurementTimingBudgetMicroSeconds(Dev, 40000);
+	VL53L1_SetInterMeasurementPeriodMilliSeconds(Dev, 50);
+	memset(&DetectionConfig, 0, sizeof(DetectionConfig));
+	DetectionConfig.DetectionMode = VL53L1_DETECTION_DISTANCE_ONLY;
+	DetectionConfig.IntrNoTarget = 0;
+	DetectionConfig.Distance.CrossMode = VL53L1_THRESHOLD_CROSSED_LOW;
+	DetectionConfig.Distance.Low = 300;
+	DetectionConfig.Distance.High = 1000;
+	VL53L1_SetThresholdConfig(Dev, &DetectionConfig);
+	VL53L1_UserRoi_t roiConfig;
+	roiConfig.TopLeftX = 0;
+	roiConfig.TopLeftY = 15;
+	roiConfig.BotRightX = 15;
+	roiConfig.BotRightY = 0;
+//	VL53L1_SetUserROI(Dev, &roiConfig);
+	VL53L1_Error err = VL53L1_ClearInterruptAndStartMeasurement(Dev);
+	sprintf(msg, "TOF1 start err: %d\r\n", err);
+	//HAL_UART_Transmit(&huart2, msg, strlen(msg), HAL_MAX_DELAY);
+}
+
+void ResetAndInitializeTOF2(void) {
+	VL53L1_DEV Dev;
+	VL53L1_DetectionConfig_t DetectionConfig;
+	uint8_t newI2C = 0x52 + 4;
+	VL53L1_Error err;
+	char msg[20];
+	/* Reset the 1 ToF sensors on the expansion board */
+	HAL_GPIO_WritePin(GPIOH, SHUT2_Pin, GPIO_PIN_RESET);
+	HAL_Delay(10);
+	/* Bring the sensors out of the reset stage one by one and set the new I2C address */
+	Dev = &devRight;
+	HAL_GPIO_WritePin(GPIOH, SHUT2_Pin, GPIO_PIN_SET);
+	HAL_Delay(50);
+	Dev->comms_speed_khz = 400;
+	Dev->I2cHandle = &hi2c1;
+	Dev->comms_type = 1;
+	Dev->I2cDevAddr = 0x52; /* default ToF sensor I2C address*/
+	err = VL53L1_SetDeviceAddress(Dev, newI2C);
+	sprintf(msg, "TOF2 address err: %d\r\n", err);
+	//HAL_UART_Transmit(&huart2, msg, strlen(msg), HAL_MAX_DELAY);
+	Dev->I2cDevAddr = newI2C;
+	/* Device Initialization and setting */
+	VL53L1_WaitDeviceBooted(Dev);
+	VL53L1_DataInit(Dev);
+	VL53L1_StaticInit(Dev);
+	/* Vérification de l'identification du capteur */
+	uint8_t device_id = 0;
+	VL53L1_RdByte(Dev, 0x010F, &device_id);
+	sprintf(msg, "TOF2 ID: 0x%02X\r\n", device_id);
+	//HAL_UART_Transmit(&huart2, msg, strlen(msg), HAL_MAX_DELAY);
+	VL53L1_SetDistanceMode(Dev, VL53L1_DISTANCEMODE_SHORT);
+	VL53L1_SetMeasurementTimingBudgetMicroSeconds(Dev, 40000);
+	VL53L1_SetInterMeasurementPeriodMilliSeconds(Dev, 50);
+	memset(&DetectionConfig, 0, sizeof(DetectionConfig));
+	DetectionConfig.DetectionMode = VL53L1_DETECTION_DISTANCE_ONLY;
+	DetectionConfig.IntrNoTarget = 0;
+	DetectionConfig.Distance.CrossMode = VL53L1_THRESHOLD_CROSSED_LOW;
+	DetectionConfig.Distance.Low = 300;
+	DetectionConfig.Distance.High = 500;
+	VL53L1_SetThresholdConfig(Dev, &DetectionConfig);
+	VL53L1_UserRoi_t roiConfig;
+	roiConfig.TopLeftX = 0;
+	roiConfig.TopLeftY = 15;
+	roiConfig.BotRightX = 15;
+	roiConfig.BotRightY = 0;
+	VL53L1_SetUserROI(Dev, &roiConfig);
+	err = VL53L1_ClearInterruptAndStartMeasurement(Dev);
+	sprintf(msg, "TOF2 start err: %d\r\n", err);
+	//HAL_UART_Transmit(&huart2, msg, strlen(msg), HAL_MAX_DELAY);
+}
+
 /*----------------------------------------------------------------------------
  *        Task
  *---------------------------------------------------------------------------*/
@@ -540,7 +693,8 @@ void vSensorTask(void *pvParameters)
             .temp_LSB  = rxSpi[1],
             .voc_index = voc,
             .voc_valid = aq_ok,
-            .air_bad   = aq_ok && update_air_bad(voc)
+            .air_bad   = aq_ok && update_air_bad(voc),
+			.tof_set	= false
         };
 
         xQueueSend(xSensorQueue, &d, pdMS_TO_TICKS(10));
@@ -556,21 +710,67 @@ void vTxCanTask(void *pv)
 
     while(1)
     {
-        if (xQueueReceive(xSensorQueue, &d, pdMS_TO_TICKS(2000)) == pdTRUE)
+        if (xQueueReceive(xSensorQueue, &d, portMAX_DELAY) == pdTRUE)
         {
-            // Température
-            Q8 t;
-            t.integer = d.temp_MSB;
-            t.dec     = d.temp_LSB & 0xC0;
-            can_send('T', t, !update_temp_bad(d.temp_MSB));
+			if (!d.tof_set){
+				 // Température
+				Q8 t;
+				t.integer = d.temp_MSB;
+				t.dec     = d.temp_LSB & 0xC0;
+				can_send('T', t, !update_temp_bad(d.temp_MSB));
 
-            // Qualité d'air
-            Q8 a;
-            a.integer = d.voc_index;
-            a.dec     = 0;
-            can_send('A', a, d.voc_valid && !d.air_bad);
+				// Qualité d'air
+				Q8 a;
+				a.integer = d.voc_index;
+				a.dec     = 0;
+				can_send('A', a, d.voc_valid && !d.air_bad);
+			}
+			else{
+				Q8 tof;
+				tof.dec = 0;
+				tof.integer = d.tof_measure;
+				can_send('S', tof, true);
+			}
+			
+           
         }
     }
+}
+
+void vReadTofTask(void *pvParameters) {
+	ResetAndInitializeTOF1();
+	ResetAndInitializeTOF2();
+	TickType_t xLastWakeTime;
+	xLastWakeTime = xTaskGetTickCount();
+
+	SensorData_t d;
+
+	while (1) {
+
+		uint8_t ready;
+		VL53L1_Error err;
+
+		xSemaphoreTake(xI2CMutex, portMAX_DELAY);
+		
+		if ((err = VL53L1_GetMeasurementDataReady(&devRight, &ready)) == VL53L1_ERROR_NONE && ready) {
+//		if (VL53L1_GetMeasurementDataReady(&devRight, &ready), ready) {
+			VL53L1_RangingMeasurementData_t measure;
+			if (VL53L1_GetRangingMeasurementData(&devRight, &measure) != VL53L1_ERROR_NONE) {
+//				printf("Failed to read TOF stop\r\n");
+			} else {
+				if (measure.RangeStatus == 0 || measure.RangeStatus == 5 ){
+					d.tof_measure = measure.RangeMilliMeter ;
+					d.tof_set = true;
+					xQueueSend(xSensorQueue, &d, pdMS_TO_TICKS(10));
+				}
+			}
+		}
+//		VL53L1_ClearInterruptAndStartMeasurement(&devRight);
+		xSemaphoreGive(xI2CMutex);
+		
+		vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(TOF_INTERVAL));
+	}
+
 }
 
 
